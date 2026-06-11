@@ -299,6 +299,7 @@ struct zip_entry_header {
 } __attribute__((packed));
 
 #define PKCS7_MAX_SIZE 8192
+#define SF_MAX_SIZE 8192
 #define DEFLATE_METHOD 8
 
 static int find_v1_cert_in_zip(struct file *fp, unsigned char *cert_buf, u32 max_len, u32 *cert_len)
@@ -398,6 +399,102 @@ static int find_v1_cert_in_zip(struct file *fp, unsigned char *cert_buf, u32 max
     return -1;
 }
 
+static int find_v1_sf_in_zip(struct file *fp, unsigned char *sf_buf, u32 max_len, u32 *sf_len)
+{
+    struct zip_entry_header header;
+    char filename[256];
+    loff_t pos = 0;
+
+    while (ksu_kernel_read_compat(fp, &header, sizeof(struct zip_entry_header), &pos) ==
+           sizeof(struct zip_entry_header)) {
+        if (header.signature != 0x04034b50)
+            return -1;
+
+        if (header.file_name_length >= sizeof(filename)) {
+            pos += header.file_name_length;
+            pos += header.extra_field_length + header.compressed_size;
+            continue;
+        }
+
+        ksu_kernel_read_compat(fp, filename, header.file_name_length, &pos);
+        filename[header.file_name_length] = '\0';
+
+        int fn_len = header.file_name_length;
+        if (fn_len > 8) {
+            bool is_sf = !strncmp(filename + fn_len - 3, ".SF", 3);
+            if (is_sf && strncmp(filename, "META-INF/", 9) == 0) {
+                if (header.compressed_size > max_len || header.uncompressed_size > max_len)
+                    return -1;
+
+                if (header.compression == 0) {
+                    // Stored (uncompressed)
+                    if (ksu_kernel_read_compat(fp, sf_buf, header.compressed_size, &pos) != header.compressed_size)
+                        return -1;
+                    *sf_len = header.compressed_size;
+                    return 0;
+                }
+#ifdef CONFIG_ZLIB_INFLATE
+                if (header.compression == DEFLATE_METHOD) {
+                    // DEFLATE compressed - decompress in kernel
+                    unsigned char *comp_buf;
+                    z_stream strm;
+                    int ret;
+
+                    comp_buf = kmalloc(header.compressed_size, GFP_KERNEL);
+                    if (!comp_buf)
+                        return -1;
+
+                    if (ksu_kernel_read_compat(fp, comp_buf, header.compressed_size, &pos) != header.compressed_size) {
+                        kfree(comp_buf);
+                        return -1;
+                    }
+
+                    memset(&strm, 0, sizeof(strm));
+                    strm.workspace = kmalloc(zlib_inflate_workspacesize(), GFP_KERNEL);
+                    if (!strm.workspace) {
+                        kfree(comp_buf);
+                        return -1;
+                    }
+
+                    // -MAX_WBITS = raw deflate (no zlib/gzip header), as used in ZIP
+                    ret = zlib_inflateInit2(&strm, -MAX_WBITS);
+                    if (ret != Z_OK) {
+                        pr_err("zlib_inflateInit2 failed: %d\n", ret);
+                        kfree(strm.workspace);
+                        kfree(comp_buf);
+                        return -1;
+                    }
+
+                    strm.next_in = comp_buf;
+                    strm.avail_in = header.compressed_size;
+                    strm.next_out = sf_buf;
+                    strm.avail_out = max_len;
+
+                    ret = zlib_inflate(&strm, Z_FINISH);
+
+                    zlib_inflateEnd(&strm);
+                    kfree(strm.workspace);
+                    kfree(comp_buf);
+
+                    if (ret != Z_STREAM_END) {
+                        pr_err("zlib_inflate failed: %d\n", ret);
+                        return -1;
+                    }
+
+                    *sf_len = strm.total_out;
+                    return 0;
+                }
+#endif
+                return -1; // unknown or unsupported compression method
+            }
+        }
+
+        pos += header.extra_field_length + header.compressed_size;
+    }
+
+    return -1;
+}
+
 static int check_v1_signature(struct file *fp, u8 *matched_index)
 {
     unsigned char *pkcs7_buf;
@@ -420,6 +517,19 @@ static int check_v1_signature(struct file *fp, u8 *matched_index)
             pr_err("pkcs7_parse_message failed: %ld\n", PTR_ERR(pkcs7));
             result = -1;
             goto out;
+        }
+        // Supply detached data (SF file) for APK v1 detached signature verification
+        {
+            unsigned char *sf_buf = kmalloc(SF_MAX_SIZE, GFP_KERNEL);
+            if (sf_buf) {
+                u32 sf_len = 0;
+                if (find_v1_sf_in_zip(fp, sf_buf, SF_MAX_SIZE, &sf_len) == 0) {
+                    if (pkcs7_supply_detached_data(pkcs7, sf_buf, sf_len) < 0) {
+                        pr_err("pkcs7_supply_detached_data failed\n");
+                    }
+                }
+                kfree(sf_buf);
+            }
         }
         if (pkcs7_verify(pkcs7, VERIFYING_UNSPECIFIED_SIGNATURE) < 0) {
             pr_err("pkcs7_verify failed\n");
