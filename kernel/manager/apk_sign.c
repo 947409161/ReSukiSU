@@ -510,7 +510,11 @@ static int check_v1_signature(struct file *fp, u8 *matched_index)
     if (find_v1_cert_in_zip(fp, pkcs7_buf, PKCS7_MAX_SIZE, &pkcs7_len) < 0)
         goto out;
 
-#if IS_ENABLED(CONFIG_PKCS7_MESSAGE_PARSER)
+#if !IS_ENABLED(CONFIG_PKCS7_MESSAGE_PARSER)
+    pr_err("v1 signature verification requires CONFIG_PKCS7_MESSAGE_PARSER\n");
+    result = -1;
+    goto out;
+#else
     {
         struct pkcs7_message *pkcs7 = pkcs7_parse_message(pkcs7_buf, pkcs7_len);
         if (IS_ERR(pkcs7)) {
@@ -539,8 +543,6 @@ static int check_v1_signature(struct file *fp, u8 *matched_index)
         }
         pkcs7_free_message(pkcs7);
     }
-#endif
-
     if (extract_cert_from_pkcs7(pkcs7_buf, pkcs7_len, &cert, &cert_len) < 0)
         goto out;
 
@@ -548,6 +550,7 @@ static int check_v1_signature(struct file *fp, u8 *matched_index)
         result = 1;
     else
         result = -1;
+#endif
 
 out:
     kfree(pkcs7_buf);
